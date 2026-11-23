@@ -1,0 +1,110 @@
+{
+  "scan_target": {
+    "tree": "Linux 5.4-rc3",
+    "makefile": "VERSION=5 PATCHLEVEL=4 SUBLEVEL=0 EXTRAVERSION=-rc3",
+    "commit_hash": "d418d070057c45fd6f21567278f95452bfe690d1",
+    "focus": "HIGH/CRITICAL local privilege escalation via eBPF, io_uring, binder, vsock, watch_queue"
+  },
+  "findings": [
+    {
+      "severity": "high",
+      "location": "fs/io_uring.c",
+      "title": "io_uring async workers run with kworker credentials (CVE-2019-19241)",
+      "description": "On this 5.4-rc3 tree, io_uring has no ctx->creds / override_creds path. Async submission (io_sq_wq_submit_work), SQPOLL (io_sq_thread), and poll completion work execute under the kernel worker/kthread credentials (UID 0, full capabilities) instead of the submitting task's creds. IORING_OP_SENDMSG is forwarded to __sys_sendmsg_sock from that context. Fixed upstream by 181e448d8709 (landed in 5.4.2); this rc still lacks any cred inheritance.",
+      "impact": "Unprivileged local attacker can escalate effective privilege for operations that authorize via current credentials (e.g. netlink/UID-sensitive paths, FUSE request headers), achieving privilege-restriction bypass / LPE (NVD CVSS 7.8).",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-4d827597-3f72-59f2-a352-3144facec097",
+      "commit_hash": "d418d070057c45fd6f21567278f95452bfe690d1",
+      "detected_at_pst": "2026-11-23T08:18:53-0800",
+      "reported_link": "",
+      "cve": "CVE-2019-19241",
+      "attack_path": "1. Unprivileged process calls io_uring_setup (no CAP required for basic rings).\n2. Submit IORING_OP_SENDMSG that blocks/fails with -EAGAIN so __io_queue_sqe punts to io_sq_wq_submit_work on a kernel workqueue.\n3. Worker runs __io_submit_sqe → io_sendmsg → __sys_sendmsg_sock with kworker creds (UID 0 / full caps).\n4. Crafted sendmsg (e.g. netlink) observes elevated current credentials and bypasses intended user restrictions.",
+      "evidence": [
+        "fs/io_uring.c:2093-2210",
+        "fs/io_uring.c:1604-1647",
+        "fs/io_uring.c:2305-2321",
+        "fs/io_uring.c:3761-3810",
+        "fs/io_uring.c:3120-3123"
+      ],
+      "remediation": "Apply 181e448d8709 / 0b8c0ec7eedc (capture submitter creds at io_uring_create; override_creds in io_sq_wq_submit_work, io_sq_thread, and poll completion). Or upgrade to >= 5.4.2. Mitigate by restricting io_uring via seccomp/LSMs if backport is unavailable.",
+      "poc_video_notes": "PoC not recorded in this run. Vulnerability confirmed by absence of any cred/override_creds symbols in fs/io_uring.c and by NVD scope (kernels < 5.4.2)."
+    },
+    {
+      "severity": "high",
+      "location": "fs/io_uring.c",
+      "title": "io_uring poll ignores POLLFREE → UAF on signalfd/binder waitqueues (CVE-2022-3176)",
+      "description": "IORING_OP_POLL attaches io_poll_wake to file waitqueues. signalfd_cleanup and binder_thread_release emit wake_up_poll(..., EPOLLHUP|POLLFREE) before freeing task-lifetime waitqueues. io_poll_wake never special-cases POLLFREE: after list_del it may complete inline or queue io_poll_complete_work, which can vfs_poll/add_wait_queue on poll->head after the queue is freed. Stable fix fc78b2fc21f10 disables polling FMODE_BUF_RASYNC/pollfree files; that guard is absent here (5.1–5.4.211 affected).",
+      "impact": "Unprivileged local attacker obtains a use-after-free on a wait_queue_head_t via io_uring POLL + signalfd (or binder on Android). Exploitable for kernel memory corruption / LPE (NVD CVSS 7.8).",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-4d827597-3f72-59f2-a352-3144facec097",
+      "commit_hash": "d418d070057c45fd6f21567278f95452bfe690d1",
+      "detected_at_pst": "2026-11-23T08:18:53-0800",
+      "reported_link": "",
+      "cve": "CVE-2022-3176",
+      "attack_path": "1. Create signalfd and an io_uring instance; submit IORING_OP_POLL on the signalfd.\n2. io_poll_add → vfs_poll → add_wait_queue(&sighand->signalfd_wqh, &poll->wait).\n3. Exit/exec or otherwise trigger signalfd_cleanup → wake_up_poll(EPOLLHUP|POLLFREE) then free/reuse the sighand waitqueue.\n4. io_poll_wake does not treat POLLFREE as teardown-only; async completion path may touch freed poll->head (UAF).",
+      "evidence": [
+        "fs/io_uring.c:1758-1786",
+        "fs/io_uring.c:1726-1755",
+        "fs/io_uring.c:1809-1874",
+        "fs/signalfd.c:36-48",
+        "drivers/android/binder.c:4780-4794"
+      ],
+      "remediation": "Backport fc78b2fc21f10 (mark signalfd/binder FMODE_BUF_RASYNC / refuse io_uring poll on pollfree files) or implement proper POLLFREE handling in io_poll_wake. Upgrade past 5.4.212 on the 5.4 stable line.",
+      "poc_video_notes": "PoC not recorded. POLLFREE string absent from fs/io_uring.c; wake path and signalfd_cleanup POLLFREE emitter verified in-tree."
+    }
+  ],
+  "rejected": [
+    {
+      "title": "eBPF ALU32 missing u32 bounds / CVE-2021-3490 class",
+      "reason": "bpf_reg_state has only s64/u64 bounds (no u32_min/max). Explicit ALU32 bounds tracking (3f50f132d840) and CVE-2021-3490 were introduced in 5.7-rc1 — not in 5.4-rc3. Missing fields here are pre-feature, not that CVE."
+    },
+    {
+      "title": "CVE-2020-8835 JMP32 bounds masking",
+      "reason": "__reg_bound_offset32 absent. Introducing commit 581738a681b6 is v5.5; 5.4-stable only gained it at 5.4.7. This rc is not affected."
+    },
+    {
+      "title": "CVE-2020-27194 / CVE-2021-31440 32-bit truncation class",
+      "reason": "Depends on scalar32_* bounds helpers from the 5.7+ ALU32 tracking era; not present in this tree."
+    },
+    {
+      "title": "CVE-2022-23222 PTR_TO_MEM vs SCALAR confusion",
+      "reason": "Later verifier class; 5.4-rc3 reg types lack the PTR_TO_MEM register-state variant used by that bug."
+    },
+    {
+      "title": "CVE-2023-2163 verifier pruning / precision taints",
+      "reason": "Precision tracking (b5dc0163d8fd) exists and the imprecise-scalar prune shortcut in regsafe() is present, but unprivileged paths force precise=true on unknown regs (allow_ptr_leaks=false). Ubuntu/Google: exploitation needs CAP_SYS_ADMIN/CAP_BPF. Rejected under unprivileged-only criteria."
+    },
+    {
+      "title": "CVE-2019-2215 binder epoll UAF",
+      "reason": "FIXED in this tree: binder_thread_release emits wake_up_poll(EPOLLHUP|POLLFREE) and synchronize_rcu() (commits f5cb779ba163 / 5eeb2ca02a2f)."
+    },
+    {
+      "title": "CVE-2021-26708 vsock multi-transport race",
+      "reason": "5.4-rc3 uses a single global transport pointer; vsock_assign_transport / per-socket transport swap arrived in 5.5-rc1. Not vulnerable."
+    },
+    {
+      "title": "watch_queue",
+      "reason": "Subsystem not present in 5.4-rc3 (added later, ~5.8)."
+    },
+    {
+      "title": "io_uring SQPOLL privilege escape",
+      "reason": "IORING_SETUP_SQPOLL correctly requires capable(CAP_SYS_ADMIN) at fs/io_uring.c:3120-3123."
+    }
+  ],
+  "environment_notes": {
+    "unprivileged_bpf_disabled_default": 0,
+    "unprivileged_bpf_evidence": [
+      "kernel/bpf/syscall.c:42",
+      "kernel/bpf/syscall.c:2830-2831",
+      "kernel/sysctl.c:1252-1261"
+    ],
+    "bpf_jit_enable_default": "IS_BUILTIN(CONFIG_BPF_JIT_ALWAYS_ON) → 0 unless JIT_ALWAYS_ON",
+    "bpf_jit_evidence": [
+      "kernel/bpf/core.c:521",
+      "net/core/sysctl_net_core.c:385-386"
+    ],
+    "unprivileged_prog_types": "BPF_PROG_TYPE_SOCKET_FILTER and BPF_PROG_TYPE_CGROUP_SKB allowed without CAP_SYS_ADMIN (syscall.c:1653-1656)"
+  }
+}
