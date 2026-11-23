@@ -2,8 +2,8 @@
   "scan_target": {
     "tree": "Linux 5.4-rc3",
     "makefile": "VERSION=5 PATCHLEVEL=4 SUBLEVEL=0 EXTRAVERSION=-rc3",
-    "commit_hash": "d418d070057c45fd6f21567278f95452bfe690d1",
-    "focus": "HIGH/CRITICAL local privilege escalation via eBPF, io_uring, binder, vsock, watch_queue"
+    "commit_hash": "de1884872d58f988960b9f6826f863675fe9727b",
+    "focus": "HIGH/CRITICAL complete attack chains: xt_compat, AF_PACKET TPACKET_V3, iSCSI netlink, TIPC MSG_CRYPTO, n_gsm/6pack (plus prior io_uring findings)"
   },
   "findings": [
     {
@@ -53,6 +53,111 @@
       ],
       "remediation": "Backport fc78b2fc21f10 (mark signalfd/binder FMODE_BUF_RASYNC / refuse io_uring poll on pollfree files) or implement proper POLLFREE handling in io_poll_wake. Upgrade past 5.4.212 on the 5.4 stable line.",
       "poc_video_notes": "PoC not recorded. POLLFREE string absent from fs/io_uring.c; wake path and signalfd_cleanup POLLFREE emitter verified in-tree."
+    },
+    {
+      "severity": "critical",
+      "location": "net/netfilter/x_tables.c + net/ipv4/netfilter/ip_tables.c (compat)",
+      "title": "xtables COMPAT IPT_SO_SET_REPLACE heap overflow (CVE-2021-22555 class)",
+      "description": "CONFIG_COMPAT path translate_compat_table → compat_copy_entry_from_user → xt_compat_{match,target}_from_user converts 32-bit rule blobs into a native table allocated from a size computed only from xt_compat_*_offset deltas. xt_compat_target_from_user copies using the user-supplied target_size, then memset-pads to XT_ALIGN(kernel targetsize) and advances *dstptr by user_size+off — before translate_table/xt_check_target ever validates that the user object size matches the kernel target. Combined with COMPAT_XT_ALIGN vs XT_ALIGN slack in next_offset/target_offset, the second pass writes past the kvmalloc'd table (classic 4-byte+ heap OOB write). Setsockopt gate is ns_capable(sock_net(sk)->user_ns, CAP_NET_ADMIN), not init_user_ns.",
+      "impact": "Local privilege escalation to root via heap corruption (msg_msg/pipe-buffer style primitives). Public exploits exist for this exact class. CVSS 8.3–8.9 range (NVD HIGH/CRITICAL depending on scoring).",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-5a163ee8-021e-5449-ac7e-5dc67e3712b9",
+      "commit_hash": "de1884872d58f988960b9f6826f863675fe9727b",
+      "detected_at_pst": "2026-11-23T08:25:58-0800",
+      "reported_link": "",
+      "cve": "CVE-2021-22555",
+      "attack_path": "1. Requires CONFIG_COMPAT + IA32_EMULATION (typical x86_64 distro) and CONFIG_USER_NS (distro-enabled; Kconfig default n).\n2. Unprivileged user: clone(CLONE_NEWUSER|CLONE_NEWNET), map uid 0, obtain CAP_NET_ADMIN in the new user_ns (ns_capable check in do_ipt_set_ctl/compat_do_ipt_set_ctl).\n3. From a 32-bit process (or compat setsockopt), craft IPT_SO_SET_REPLACE / IP6T_SO_SET_REPLACE / ARPT_SO_SET_REPLACE blob with malicious target_offset/next_offset/padding.\n4. Kernel allocate-undersized xt_table_info, overflow during compat_copy_entry_from_user / xt_compat_target_from_user, escalate via heap primitives.",
+      "evidence": [
+        "net/netfilter/x_tables.c:1112-1138 (xt_compat_target_from_user pad + *dstptr += user_tsize+off)",
+        "net/netfilter/x_tables.c:729-756 (xt_compat_match_from_user same pattern)",
+        "net/netfilter/x_tables.c:801-846 (xt_compat_check_entry_offsets — no user_size vs kernel targetsize check)",
+        "net/ipv4/netfilter/ip_tables.c:1354-1388 (compat_copy_entry_from_user)",
+        "net/ipv4/netfilter/ip_tables.c:1390-1465 (translate_compat_table allocates then copies before native validate)",
+        "net/ipv4/netfilter/ip_tables.c:1543-1547 / 1667-1671 (ns_capable CAP_NET_ADMIN)",
+        "net/ipv4/netfilter/arp_tables.c:1122-1202 (same compat pattern)",
+        "net/ipv6/netfilter/ip6_tables.c:1371-1457 (same compat pattern)"
+      ],
+      "remediation": "Backport the CVE-2021-22555 fixes (strict size/offset validation before compat copy; ensure allocated native size covers XT_ALIGN padding). Or upgrade past fixed 5.4.stable / 5.10.41 / 5.12.8. Temporary mitigations: disable unprivileged user namespaces; restrict 32-bit/compat; drop CONFIG_COMPAT if unused.",
+      "poc_video_notes": "Not executed in-VM. Overflow math and missing pre-copy size checks verified in-tree; public BFS/Google exploit targets this code shape."
+    },
+    {
+      "severity": "critical",
+      "location": "net/packet/af_packet.c",
+      "title": "AF_PACKET TPACKET_V3 macoff/netoff u16 overflow (CVE-2020-14386 class)",
+      "description": "tpacket_rcv declares macoff/netoff as unsigned short. PACKET_RESERVE accepts any value <= INT_MAX with no upper bound relative to frame geometry. netoff = TPACKET_ALIGN(tp_hdrlen[+maclen]) + tp_reserve [+ virtio_net_hdr] is truncated on assignment; when the full sum exceeds 0xffff, macoff wraps (including unsigned underflow when truncated netoff < maclen). With PACKET_VNET_HDR, virtio_net_hdr_from_skb writes to h.raw + macoff - sizeof(virtio_net_hdr), which can be before the frame when macoff < 10 after wrap. skb_copy_bits then copies snaplen bytes at the corrupted macoff. Ring setup only enforces frame/block >= tp_hdrlen+tp_reserve (unsigned int), so large reserve still installs a ring.",
+      "impact": "Unprivileged local heap overflow → reliable LPE (public exploits). NVD CVSS 7.8 HIGH; treated as CRITICAL here due to complete unprivileged userns+netns chain.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-5a163ee8-021e-5449-ac7e-5dc67e3712b9",
+      "commit_hash": "de1884872d58f988960b9f6826f863675fe9727b",
+      "detected_at_pst": "2026-11-23T08:25:58-0800",
+      "reported_link": "",
+      "cve": "CVE-2020-14386",
+      "attack_path": "1. CONFIG_USER_NS + CONFIG_PACKET (standard). clone(CLONE_NEWUSER|CLONE_NEWNET); map uid 0 → CAP_NET_RAW via ns_capable in packet_create.\n2. socket(AF_PACKET, SOCK_RAW, …); setsockopt(PACKET_VERSION, TPACKET_V3); setsockopt(PACKET_VNET_HDR, 1); setsockopt(PACKET_RESERVE, value causing netoff > 0xffff).\n3. setsockopt(PACKET_RX_RING) with block_size >= tp_hdrlen+reserve.\n4. Inject/receive a frame (loopback/PACKET_OUTGOING). tpacket_rcv truncates macoff/netoff and writes OOB (vnet header and/or packet payload) into adjacent kernel heap.",
+      "evidence": [
+        "net/packet/af_packet.c:2163 (unsigned short macoff, netoff)",
+        "net/packet/af_packet.c:2217-2230 (netoff/macoff calc + optional vnet)",
+        "net/packet/af_packet.c:2281-2285 (virtio_net_hdr_from_skb at macoff - sizeof(vnet))",
+        "net/packet/af_packet.c:2294 (skb_copy_bits to h.raw + macoff)",
+        "net/packet/af_packet.c:3733-3747 (PACKET_RESERVE allows up to INT_MAX)",
+        "net/packet/af_packet.c:4315-4321 (min_frame_size uses full-width tp_reserve)",
+        "net/packet/af_packet.c:3221-3222 (ns_capable CAP_NET_RAW)"
+      ],
+      "remediation": "Widen macoff/netoff to unsigned int (upstream fix for CVE-2020-14386); bound tp_reserve so netoff cannot exceed frame/block geometry; refuse combinations with PACKET_VNET_HDR that make macoff < sizeof(virtio_net_hdr). Upgrade to fixed 5.4.stable / >= 5.8.1.",
+      "poc_video_notes": "Arithmetic for u16 wrap + vnet underflow (macoff < 10 ⇒ write before frame) verified against this source. Full LPE PoC not run in this environment."
+    },
+    {
+      "severity": "high",
+      "location": "drivers/scsi/scsi_transport_iscsi.c + drivers/scsi/libiscsi.c",
+      "title": "iSCSI NETLINK_ISCSI unbounded attrs: heap overflow + OOB read + pointer leak (CVE-2021-27365/27364/27363)",
+      "description": "NETLINK_ISCSI is registered on init_net without NL_CFG_F_NONROOT_* flags, but netlink_sendmsg only enforces CAP_NET_ADMIN when dst_portid/dst_group are non-zero — sends to the kernel (pid 0) are allowed for any local user. iscsi_if_recv_msg has no capable() check. iscsi_if_rx only checks nlmsg_len >= sizeof(uevent); it never validates set_param.len / send_pdu.hdr_size/data_size against remaining payload (OOB read, CVE-2021-27364). String params go through iscsi_switch_str_param → kstrdup without a PAGE_SIZE cap; sysfs show paths then sprintf(\"%s\\n\", …) into a PAGE_SIZE buffer (heap overflow, CVE-2021-27365). show_transport_handle is S_IRUGO and sprintf's the kernel transport pointer (CVE-2021-27363), also supplying the handle needed for netlink messages.",
+      "impact": "Unprivileged local user: kernel pointer leak, kernel OOB read, and PAGE_SIZE heap overflow via sysfs show after planting a long string — DoS or LPE when transport module is loaded (scsi_transport_iscsi / iscsi_tcp).",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-5a163ee8-021e-5449-ac7e-5dc67e3712b9",
+      "commit_hash": "de1884872d58f988960b9f6826f863675fe9727b",
+      "detected_at_pst": "2026-11-23T08:25:58-0800",
+      "reported_link": "",
+      "cve": "CVE-2021-27365,CVE-2021-27364,CVE-2021-27363",
+      "attack_path": "1. Prerequisites: scsi_transport_iscsi loaded (common when open-iscsi stack present). No user/net ns required — works in init_net as normal UID.\n2. Read /sys/class/iscsi_transport/*/handle (world-readable) → kernel pointer + transport_handle.\n3. socket(AF_NETLINK, SOCK_RAW, NETLINK_ISCSI); send ISCSI_UEVENT_CREATE_SESSION / CREATE_CONN / SET_PARAM with transport_handle (dst pid 0 bypasses netlink CAP check).\n4a. SET_PARAM string field longer than PAGE_SIZE → kstrdup stores it; later sysfs read → sprintf overflow (27365).\n4b. SET_PARAM/SEND_PDU with len/hdr_size/data_size past nlmsg end → OOB read (27364).",
+      "evidence": [
+        "drivers/scsi/scsi_transport_iscsi.c:120-127 (show_transport_handle S_IRUGO pointer leak)",
+        "drivers/scsi/scsi_transport_iscsi.c:2756-2778 (iscsi_set_param uses ev+1 + set_param.len unchecked)",
+        "drivers/scsi/scsi_transport_iscsi.c:3591-3597 (SEND_PDU hdr_size/data_size unchecked)",
+        "drivers/scsi/scsi_transport_iscsi.c:3475-3500 (iscsi_if_recv_msg — no capable())",
+        "drivers/scsi/scsi_transport_iscsi.c:3674-3716 (iscsi_if_rx length check only covers uevent header)",
+        "drivers/scsi/scsi_transport_iscsi.c:4518-4558 (netlink_kernel_create init_net, no NONROOT flags)",
+        "drivers/scsi/libiscsi.c:3186-3202 (iscsi_switch_str_param kstrdup unbounded)",
+        "drivers/scsi/libiscsi.c:3366-3399 / 3603-3611 (sprintf %s into sysfs PAGE_SIZE buf)",
+        "net/netlink/af_netlink.c:1861-1872 (CAP check skipped when dst_portid==0 && dst_group==0)"
+      ],
+      "remediation": "Backport CVE-2021-27363/64/65: restrict handle sysfs; validate all netlink payload lengths against nlmsg_len; cap string params to PAGE_SIZE-1 and use snprintf in show methods; require CAP_SYS_ADMIN (or netlink_capable) in iscsi_if_recv_msg. Unload iscsi transport modules if unused.",
+      "poc_video_notes": "Control-flow and missing length/cap checks verified in source. Exploitability requires a registered iscsi_transport (module present)."
+    },
+    {
+      "severity": "high",
+      "location": "drivers/net/hamradio/6pack.c",
+      "title": "6pack decode_data unbounded cooked_buf heap overflow",
+      "description": "decode_data appends three bytes to cooked_buf[400] via rx_count_cooked++ with no upper bound. sixpack_decode feeds decode_data for every non-command byte while SIXP_RX_DCD_MASK is set (attacker sets DCD via a priority command byte). A userspace writer on a tty with N_6PACK ldisc can flood data bytes without SEOF and overrun the kmalloc'd struct sixpack cooked_buf into adjacent heap. tiocsetd has no CAP_SYS_ADMIN gate in this tree; a PTY + TIOCSETD(N_6PACK) is sufficient when the 6pack module is available (autoload or preloaded).",
+      "impact": "Local kernel heap overflow from an unprivileged tty writer → DoS or LPE when CONFIG_SIXPACK is enabled/loadable.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-5a163ee8-021e-5449-ac7e-5dc67e3712b9",
+      "commit_hash": "de1884872d58f988960b9f6826f863675fe9727b",
+      "detected_at_pst": "2026-11-23T08:25:58-0800",
+      "reported_link": "",
+      "cve": "",
+      "attack_path": "1. Open a PTY pair (unprivileged).\n2. ioctl(TIOCSETD, N_6PACK) on the slave (no capability check in tiocsetd; module autoload if CONFIG_LDISC_AUTOLOAD).\n3. Write a 6pack priority command that sets SIXP_RX_DCD_MASK.\n4. Write >400 payload data bytes without SIXP_SEOF → decode_data overflows cooked_buf[400].",
+      "evidence": [
+        "drivers/net/hamradio/6pack.c:97-98 (cooked_buf[400])",
+        "drivers/net/hamradio/6pack.c:832-849 (decode_data — no rx_count_cooked bound)",
+        "drivers/net/hamradio/6pack.c:951-969 (sixpack_decode calls decode_data while DCD set)",
+        "drivers/net/hamradio/6pack.c:435-461 (sixpack_receive_buf from tty)",
+        "drivers/tty/tty_io.c:2326-2336 (tiocsetd — no capable())"
+      ],
+      "remediation": "Reject decode_data when rx_count_cooked would exceed sizeof(cooked_buf)-3; reset state on overflow. Consider requiring CAP_SYS_ADMIN to attach N_6PACK. Disable/unload 6pack if unused.",
+      "poc_video_notes": "Bounds absence and DCD-gated path verified in source. Not runtime-exploited in this run (module may be modular)."
     }
   ],
   "rejected": [
@@ -91,20 +196,25 @@
     {
       "title": "io_uring SQPOLL privilege escape",
       "reason": "IORING_SETUP_SQPOLL correctly requires capable(CAP_SYS_ADMIN) at fs/io_uring.c:3120-3123."
+    },
+    {
+      "title": "TIPC MSG_CRYPTO / CVE-2021-43267",
+      "reason": "MSG_CRYPTO, tipc_crypto, and aead_key netlink paths are absent under net/tipc/ in 5.4-rc3. That feature landed in later kernels (~5.10+). Not vulnerable to CVE-2021-43267."
+    },
+    {
+      "title": "n_gsm line-discipline decoder HIGH LPE",
+      "reason": "gsm0_receive bounds gsm->len against mru before GSM_DATA; gsm1_receive stops at count > mru with OVERRUN. buf is kmalloc(MAX_MRU+1). No complete unprivileged HIGH overflow chain verified in this rc comparable to the named CVE classes. Residual locking/UAF classes exist in later CVEs but were not confirmed as complete attack chains here."
+    },
+    {
+      "title": "xtables / AF_PACKET requiring CAP_NET_ADMIN in init_user_ns only",
+      "reason": "Rejected as a dismiss path: both use ns_capable(net->user_ns, …). With CONFIG_USER_NS, unprivileged CLONE_NEWUSER|CLONE_NEWNET yields the needed caps inside the new ns — valid bypass per audit criteria."
     }
   ],
   "environment_notes": {
-    "unprivileged_bpf_disabled_default": 0,
-    "unprivileged_bpf_evidence": [
-      "kernel/bpf/syscall.c:42",
-      "kernel/bpf/syscall.c:2830-2831",
-      "kernel/sysctl.c:1252-1261"
-    ],
-    "bpf_jit_enable_default": "IS_BUILTIN(CONFIG_BPF_JIT_ALWAYS_ON) → 0 unless JIT_ALWAYS_ON",
-    "bpf_jit_evidence": [
-      "kernel/bpf/core.c:521",
-      "net/core/sysctl_net_core.c:385-386"
-    ],
-    "unprivileged_prog_types": "BPF_PROG_TYPE_SOCKET_FILTER and BPF_PROG_TYPE_CGROUP_SKB allowed without CAP_SYS_ADMIN (syscall.c:1653-1656)"
+    "user_ns_kconfig_default": "n (distros typically enable CONFIG_USER_NS=y)",
+    "compat_kconfig": "CONFIG_COMPAT def_bool y when IA32_EMULATION on x86_64",
+    "packet_socket": "CONFIG_PACKET tristate — enabled on virtually all distro kernels",
+    "iscsi": "Attack needs scsi_transport_iscsi registered; no userns required",
+    "sixpack": "CONFIG_SIXPACK modular/optional; needs ldisc attach (autoload or preloaded)"
   }
 }
